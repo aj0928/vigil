@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { CONFLICT_FEEDBACK_KEY, conflictDispatchDue, pollFingerprint, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
+import { REPO, CONFLICT_FEEDBACK_KEY, conflictDispatchDue, pollFingerprint, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
 import { readPr, writePr as writePrState } from './bin/mivo-state.mjs';
-import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './handoff.fixture.mjs';
 
 // 2026-11-05: #1746 stayed CONFLICTING while every round reported `fingerprint-unchanged`. The conflict had been
 // delivered once (its cursor stamp is head + mergeable), the repair session then blocked, and nothing ever sent a
@@ -75,12 +75,12 @@ function collectedConflict(extra = {}) {
   };
 }
 
-function poll(paths, { snapshot, collect, dispatchFn, enabled = true, allowDispatch = true }) {
+function poll(paths, { snapshot, collect, dispatchFn, enabled = true, allowDispatch = true, childPrs = [] }) {
   let collected = 0;
   const result = scanOnce({
     mode: 'poll', enabled, allowDispatch, paths, now, nodeId, prNumber: 1746,
     snapshotFn: () => snapshot,
-    ghFn: (args) => (args[0] === 'api' ? 'owner' : args[0] === 'pr' && args[1] === 'view' ? JSON.stringify({ id: nodeId, state: 'OPEN' }) : '[]'),
+    ghFn: (args) => (isChildPrList(args) ? JSON.stringify([childPrs]) : args[0] === 'api' ? 'owner' : args[0] === 'pr' && args[1] === 'view' ? JSON.stringify({ id: nodeId, state: 'OPEN' }) : '[]'),
     collect: (...args) => {
       collected += 1;
       return withAuthorHandoff(collect(...args), args[0]);
@@ -283,4 +283,24 @@ test('a leftover dry pending dispatch is cleared and does not block the conflict
   assert.match(params.message, /"key":"conflict:merge-conflict"/);
   assert.ok(entry.conflictDispatch);
   assert.notEqual(entry.pendingDispatch?.dispatchId, 'dry-1746-old');
+});
+
+// 2026-11-26: a conflict is due, but the head branch already has an open vigil child PR (#329): no new dispatch,
+// so the stage PR does not collect a second overlapping child PR.
+test('a due conflict is not dispatched while a child PR into the head branch is open', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths);
+  const repo = REPO;
+  let dispatched = 0;
+  const { result, entry } = poll(paths, {
+    snapshot: snap(),
+    collect: collectedConflict,
+    childPrs: [{ number: 1801, html_url: `https://github.com/${repo}/pull/1801`,
+      head: { ref: 'vigil/pr-1746-fix-aaaaaaaaaaaa', sha: HEAD, repo: { full_name: repo } }, base: { ref: 'fix/1746' } }],
+    dispatchFn: () => { dispatched += 1; return { target_session_id: 'sess-1746' }; },
+  });
+  assert.equal(dispatched, 0);
+  assert.equal(result.prs[0].dispatch.attempted, false);
+  assert.equal(result.prs[0].dispatch.reason, 'child-pr-open');
+  assert.equal(entry.conflictDispatch, undefined);
 });
